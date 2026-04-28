@@ -16,6 +16,12 @@ A custom version of the GodotSteam plugin, made to be comptaible with ChillCube'
 | **_pending_lobby_setup** | `bool` | `false` | Flag to delay lobby setup until we're in the tree |
 | **_pending_client_setup** | `bool` | `false` | Flag to delay client setup until we're in the tree |
 | **_pending_host_id** | `int` | `0` | Stored host ID for pending client setup |
+| **player_skill** | `float` | `500.0` | Player skill rating (1-5000), starts neutral at 500 |
+| **use_skill_matchmaking** | `bool` | `false` | Set to true to enable skill-based matching |
+| **skill_falloff_enabled** | `bool` | `false` | Set to true to enable skill decay over time |
+| **skill_falloff_amount** | `float` | `10.0` | How much skill is lost per falloff tick |
+| **skill_falloff_interval_days** | `int` | `7` | Days between falloff ticks |
+| **skill_falloff_minimum** | `float` | `100.0` | Skill won't decay below this level |
 
 ### 🔔 Signals
 | Signal | Arguments | Description |
@@ -26,16 +32,18 @@ A custom version of the GodotSteam plugin, made to be comptaible with ChillCube'
 | **lobby_member_joined** | `member_id: int` |  A member joined the lobby |
 | **lobby_member_left** | `member_id: int` |  A member left the lobby |
 | **lobby_member_data_changed** | `member_id: int`<br>`key: String`<br>`value: String` |  A member's data changed |
+| **player_connected** | `id: int` |  A player connected to the multiplayer peer |
+| **player_disconnected** | `id: int` |  A player disconnected from the multiplayer peer |
 | **static func get_instance** | `` |  Returns the SteamManager instance for connecting signals |
 | **func _setup_callbacks** | `` |  Connects all Steam lobby signals to their handler functions for both host and client |
-| **func _on_lobby_match_list** | `lobbies: Array` |  Receives, stores, and emits signal with the list of lobbies found from search |
 
 ### 🛠️ Methods
 | Method | Arguments | Returns | Description |
 | :--- | :--- | :--- | :--- |
-| **static func initialize_steam()** | `p_scene : PackedScene` | `void` |  Sets up Steam with the app ID and stores the player scene reference |
+| **static func initialize_steam()** | `p_scene : PackedScene = null` | `void` |  Sets up Steam with the app ID. Player scene is optional. |
 | **static func _ensure_instance()** | - | `void` |  Creates the singleton SteamManager node and adds it to the scene tree if it doesn't exist |
 | **static func get_instance()** | - | `SteamManager` |  Returns the SteamManager instance for connecting signals |
+| **static func set_player_scene()** | `p_scene: PackedScene` | `void` |  Sets the player scene after initialization |
 | **add_to_autospawn()** | `scene: PackedScene` | `void` |  Adds additional scenes to the spawn list for network synchronization |
 | **static func host_public_lobby()** | `max_players:int = 4` | `void` |  Creates a public lobby visible to everyone on Steam |
 | **static func host_public_lobby_with_name()** | `lobby_name: String`<br>`max_players:int = 4` | `void` |  Creates a public lobby with a custom name |
@@ -81,7 +89,17 @@ A custom version of the GodotSteam plugin, made to be comptaible with ChillCube'
 | **clear_rich_presence()** | - | `void` |  Clears all rich presence data |
 | **set_lobby_game_server()** | - | `void` |  Associates a game server with the lobby (for server browsing) |
 | **get_lobby_game_server()** | - | `Dictionary` |  Gets the game server info for the lobby |
-| **find_any_lobby()** | - | `void` |  Finds the first available lobby and joins it |
+| **get_player_skill()** | - | `float` |  Returns the current player skill rating |
+| **increase_skill()** | `amount: float = 25.0` | `void` |  Increases player skill and saves |
+| **decrease_skill()** | `amount: float = 25.0` | `void` |  Decreases player skill and saves |
+| **set_skill()** | `new_skill: float` | `void` |  Sets player skill to a specific value and saves |
+| **enable_skill_matchmaking()** | `enabled: bool` | `void` |  Toggle skill-based matchmaking on/off |
+| **save_skill()** | - | `void` |  Saves the player skill to disk |
+| **load_skill()** | - | `void` |  Loads the player skill from disk, defaults to 500 |
+| **get_skill_falloff_info()** | - | `Dictionary` |  Returns information about the falloff state |
+| **get_lobby_average_skill()** | - | `float` |  Calculates the average skill of all lobby members |
+| **update_lobby_skill()** | - | `void` |  Updates the lobby's skill data |
+| **join_random_lobby()** | - | `void` |  Joins a random lobby with smart or skill-based matching |
 
 ---
 

@@ -23,6 +23,18 @@ var _pending_lobby_setup : bool = false  ## Flag to delay lobby setup until we'r
 var _pending_client_setup : bool = false  ## Flag to delay client setup until we're in the tree
 var _pending_host_id : int = 0  ## Stored host ID for pending client setup
 
+## Skill system - defaults work out of the box, no setup needed
+static var player_skill : float = 500.0  ## Player skill rating (1-5000), starts neutral at 500
+static var use_skill_matchmaking : bool = false  ## Set to true to enable skill-based matching
+static var save_path : String = "user://steam_skill.save"
+
+## Skill falloff system - configure via these static variables, no code changes needed
+static var skill_falloff_enabled : bool = false  ## Set to true to enable skill decay over time
+static var skill_falloff_amount : float = 10.0  ## How much skill is lost per falloff tick
+static var skill_falloff_interval_days : int = 7  ## Days between falloff ticks
+static var skill_falloff_minimum : float = 100.0  ## Skill won't decay below this level
+static var last_skill_update_path : String = "user://steam_skill_last_update.save"
+
 signal lobby_created(type);
 signal lobby_joined(type);
 signal lobby_list_received  ## Signal to notify when lobby list is ready
@@ -31,13 +43,14 @@ signal lobby_data_changed(key: String, value: String, member_id: int)  ## Custom
 signal lobby_member_joined(member_id: int)  ## A member joined the lobby
 signal lobby_member_left(member_id: int)  ## A member left the lobby
 signal lobby_member_data_changed(member_id: int, key: String, value: String)  ## A member's data changed
+signal player_connected(id: int)  ## A player connected to the multiplayer peer
+signal player_disconnected(id: int)  ## A player disconnected from the multiplayer peer
 
 #region Initialize the Steam Manager -----------------------------
-static func initialize_steam(p_scene : PackedScene) -> void: ## Sets up Steam with the app ID and stores the player scene reference
+static func initialize_steam(p_scene : PackedScene = null) -> void: ## Sets up Steam with the app ID. Player scene is optional.
 	if not initialized:
 		player_scene = p_scene
 		
-		# Get the project name to use as game identifier
 		game_id = ProjectSettings.get_setting("application/config/name", "UnknownGame")
 		print("Game ID set to: ", game_id)
 		
@@ -45,6 +58,11 @@ static func initialize_steam(p_scene : PackedScene) -> void: ## Sets up Steam wi
 		Steam.initRelayNetworkAccess();
 		_ensure_instance()
 		Steam.lobby_created.connect(_instance._on_lobby_created)
+		
+		# Load saved skill and apply any falloff
+		_instance.load_skill()
+		_instance._apply_skill_falloff()
+		
 		initialized = true;
 		is_steam_ready = true;
 
@@ -58,14 +76,14 @@ static func _ensure_instance() -> void: ## Creates the singleton SteamManager no
 		
 		print("SteamManager added to root viewport")
 		_instance._setup_callbacks()
-		if player_scene == null:
-			assert(false, "You must either run 'initialize_steam(player_scene) or set SteamManager.player_scene to the player scene'");
-		else:
-			initialize_steam(player_scene)
 
 static func get_instance() -> SteamManager: ## Returns the SteamManager instance for connecting signals
 	_ensure_instance()
 	return _instance
+
+static func set_player_scene(p_scene: PackedScene) -> void: ## Sets the player scene after initialization
+	player_scene = p_scene
+	print("Player scene set")
 
 func _ready() -> void: ## Called when node enters scene tree - handle any pending setups
 	if _pending_lobby_setup:
@@ -94,13 +112,15 @@ func _setup_callbacks() -> void: ## Connects all Steam lobby signals to their ha
 func _setup_spawner(auto_spawn_scenes : Array[PackedScene] = []) -> void: ## Creates and configures the MultiplayerSpawner for automatic player spawning
 	if spawner:
 		return
+	if player_scene == null:
+		print("No player_scene set, skipping MultiplayerSpawner")
+		return
 	
 	spawner = MultiplayerSpawner.new()
 	spawner.name = "PlayerSpawner"
 	spawner.spawn_path = NodePath("/root")
 	spawner.spawn_function = _spawn_custom
 	
-	# Store player scene and any additional scenes
 	_spawnable_scenes = [player_scene]
 	for scene in auto_spawn_scenes:
 		if not _spawnable_scenes.has(scene):
@@ -193,7 +213,6 @@ static func get_lobby_list() -> void: ## Requests a list of all available lobbie
 		return
 	print("Requesting lobby list for game: ", game_id)
 	
-	# Filter to only show lobbies from this specific game
 	Steam.addRequestLobbyListStringFilter("game", game_id, Steam.LOBBY_COMPARISON_EQUAL)
 	Steam.addRequestLobbyListDistanceFilter(Steam.LOBBY_DISTANCE_FILTER_WORLDWIDE)
 	Steam.requestLobbyList()
@@ -458,46 +477,369 @@ func get_lobby_game_server() -> Dictionary: ## Gets the game server info for the
 #endregion ---------------------------------------------------------
 
 
-#region Quick Matchmaking Helpers --------------------------------
+#region Skill System ----------------------------------------------
 
-func find_any_lobby() -> void: ## Finds the first available lobby and joins it
-	_ensure_instance()
-	if not is_steam_ready:
-		print("Steam is not ready yet!")
+func get_player_skill() -> float: ## Returns the current player skill rating
+	return player_skill
+
+func increase_skill(amount: float = 25.0) -> void: ## Increases player skill and saves
+	player_skill = min(player_skill + amount, 5000.0)
+	print("Skill increased by ", amount, " -> New skill: ", player_skill)
+	_save_last_skill_update()
+	save_skill()
+	if lobby_id != 0:
+		set_member_data("skill", str(player_skill))
+		update_lobby_skill()
+
+func decrease_skill(amount: float = 25.0) -> void: ## Decreases player skill and saves
+	player_skill = max(player_skill - amount, 1.0)
+	print("Skill decreased by ", amount, " -> New skill: ", player_skill)
+	_save_last_skill_update()
+	save_skill()
+	if lobby_id != 0:
+		set_member_data("skill", str(player_skill))
+		update_lobby_skill()
+
+func set_skill(new_skill: float) -> void: ## Sets player skill to a specific value and saves
+	player_skill = clamp(new_skill, 1.0, 5000.0)
+	print("Skill set to: ", player_skill)
+	_save_last_skill_update()
+	save_skill()
+	if lobby_id != 0:
+		set_member_data("skill", str(player_skill))
+		update_lobby_skill()
+
+func enable_skill_matchmaking(enabled: bool) -> void: ## Toggle skill-based matchmaking on/off
+	use_skill_matchmaking = enabled
+	print("Skill matchmaking: ", "ON" if enabled else "OFF")
+
+func save_skill() -> void: ## Saves the player skill to disk
+	var file = FileAccess.open(save_path, FileAccess.WRITE)
+	if file:
+		file.store_var(player_skill)
+		file.close()
+	else:
+		print("Note: Could not save skill")
+
+func load_skill() -> void: ## Loads the player skill from disk, defaults to 500
+	if FileAccess.file_exists(save_path):
+		var file = FileAccess.open(save_path, FileAccess.READ)
+		if file:
+			player_skill = file.get_var()
+			file.close()
+			print("Skill loaded: ", player_skill)
+		else:
+			player_skill = 500.0
+	else:
+		player_skill = 500.0
+
+#endregion ---------------------------------------------------------
+
+
+#region Skill Falloff System --------------------------------------
+
+## Configure falloff by changing these static variables (no code changes needed):
+##   SteamManager.skill_falloff_enabled = true           -- Enable falloff
+##   SteamManager.skill_falloff_amount = 10.0             -- Skill lost per tick
+##   SteamManager.skill_falloff_interval_days = 7         -- Days between ticks
+##   SteamManager.skill_falloff_minimum = 100.0           -- Skill won't go below this
+
+func _save_last_skill_update() -> void: ## Saves the timestamp of the last skill update
+	var file = FileAccess.open(last_skill_update_path, FileAccess.WRITE)
+	if file:
+		file.store_var(Time.get_unix_time_from_system())
+		file.close()
+
+func _get_last_skill_update() -> float: ## Returns the timestamp of the last skill update, or 0 if never
+	if FileAccess.file_exists(last_skill_update_path):
+		var file = FileAccess.open(last_skill_update_path, FileAccess.READ)
+		if file:
+			var timestamp = file.get_var()
+			file.close()
+			return timestamp
+	return 0.0
+
+func _apply_skill_falloff() -> void: ## Checks for and applies skill decay based on inactivity
+	if not skill_falloff_enabled:
 		return
 	
-	print("Quick match: finding any lobby...")
+	var last_update = _get_last_skill_update()
+	if last_update <= 0:
+		# First time playing, no falloff to apply
+		_save_last_skill_update()
+		return
+	
+	var current_time = Time.get_unix_time_from_system()
+	var seconds_since_update = current_time - last_update
+	var days_since_update = seconds_since_update / 86400.0  # 86400 seconds = 1 day
+	
+	if days_since_update < skill_falloff_interval_days:
+		return  # Not enough time has passed
+	
+	# Calculate how many falloff ticks to apply
+	var ticks = floor(days_since_update / skill_falloff_interval_days)
+	var total_falloff = ticks * skill_falloff_amount
+	var old_skill = player_skill
+	
+	player_skill = max(player_skill - total_falloff, skill_falloff_minimum)
+	
+	if player_skill < old_skill:
+		print("Skill decay applied: ", old_skill, " -> ", player_skill, " (", ticks, " ticks of ", skill_falloff_amount, " after ", days_since_update, " days)")
+		save_skill()
+		_save_last_skill_update()
+
+func get_skill_falloff_info() -> Dictionary: ## Returns information about the falloff state
+	var last_update = _get_last_skill_update()
+	var days_since = 0.0
+	var next_tick_days = 0.0
+	
+	if last_update > 0:
+		var current_time = Time.get_unix_time_from_system()
+		var seconds_since = current_time - last_update
+		days_since = seconds_since / 86400.0
+		next_tick_days = skill_falloff_interval_days - fmod(days_since, skill_falloff_interval_days)
+	
+	return {
+		"falloff_enabled": skill_falloff_enabled,
+		"falloff_amount": skill_falloff_amount,
+		"falloff_interval_days": skill_falloff_interval_days,
+		"falloff_minimum": skill_falloff_minimum,
+		"days_since_update": days_since,
+		"days_until_next_tick": next_tick_days,
+		"current_skill": player_skill
+	}
+
+#endregion ---------------------------------------------------------
+
+
+#region Lobby Skill Average ---------------------------------------
+
+func get_lobby_average_skill() -> float: ## Calculates the average skill of all lobby members
+	if lobby_id == 0:
+		return player_skill
+	
+	var total_skill: float = 0.0
+	var member_count: int = 0
+	var members = get_lobby_members()
+	
+	for member_id in members:
+		var skill_str = get_member_data(member_id, "skill")
+		if skill_str != "":
+			total_skill += float(skill_str)
+			member_count += 1
+	
+	if member_count == 0:
+		return 500.0
+	
+	return total_skill / float(member_count)
+
+func update_lobby_skill() -> void: ## Updates the lobby's skill data
+	if lobby_id == 0:
+		return
+	
+	set_member_data("skill", str(player_skill))
+	var avg_skill = get_lobby_average_skill()
+	set_lobby_data_float("avg_skill", avg_skill)
+
+#endregion ---------------------------------------------------------
+
+
+#region Smart Matchmaking -----------------------------------------
+
+func join_random_lobby() -> void: ## Joins a random lobby with smart or skill-based matching
+	if use_skill_matchmaking:
+		join_lobby_by_skill(200.0)
+	else:
+		_join_random_lobby_no_skill()
+
+func _join_random_lobby_no_skill() -> void: ## Standard smart matching without skill
+	_ensure_instance()
+	if not is_steam_ready or lobby_id != 0:
+		return
+	
+	print("Smart matchmaking: fetching lobby list...")
 	Steam.addRequestLobbyListStringFilter("game", game_id, Steam.LOBBY_COMPARISON_EQUAL)
 	Steam.addRequestLobbyListDistanceFilter(Steam.LOBBY_DISTANCE_FILTER_WORLDWIDE)
-	Steam.addRequestLobbyListResultCountFilter(1)
 	Steam.requestLobbyList()
 	
-	if not _instance.lobby_list_received.is_connected(_on_quick_match_list):
-		_instance.lobby_list_received.connect(_on_quick_match_list, CONNECT_ONE_SHOT)
+	if not _instance.lobby_list_received.is_connected(_on_smart_match_list):
+		_instance.lobby_list_received.connect(_on_smart_match_list, CONNECT_ONE_SHOT)
 
-func _on_quick_match_list() -> void: ## Auto-joins the first lobby in the list for quick match
-	if lobby_list.size() > 0:
-		print("Quick match: joining lobby ", lobby_list[0]["id"])
-		join_lobby(lobby_list[0]["id"])
-	else:
-		print("Quick match: no lobbies found. Creating one...")
+func _on_smart_match_list() -> void:
+	if lobby_list.is_empty():
+		print("Smart matchmaking: no lobbies found. Creating one...")
 		host_public_lobby()
+		return
+	
+	var scored_lobbies: Array = []
+	for lobby in lobby_list:
+		var score: float = _calculate_lobby_score(lobby)
+		scored_lobbies.append({
+			"id": lobby["id"], "name": lobby["name"],
+			"players": lobby["players"], "max_players": lobby["max_players"],
+			"score": score
+		})
+	
+	scored_lobbies.sort_custom(func(a, b): return a["score"] > b["score"])
+	
+	print("\n=== Smart Matchmaking Results ===")
+	for i in range(min(5, scored_lobbies.size())):
+		var lobby = scored_lobbies[i]
+		print("%d. %s | Players: %d/%d | Score: %.1f" % [i+1, lobby["name"], lobby["players"], lobby["max_players"], lobby["score"]])
+	print("==================================\n")
+	
+	join_lobby(scored_lobbies[0]["id"])
+
+func _calculate_lobby_score(lobby: Dictionary) -> float:
+	var score: float = 0.0
+	var players: int = lobby["players"]
+	var max_players: int = lobby["max_players"]
+	var fill_ratio: float = float(players) / float(max_players) if max_players > 0 else 0.0
+	
+	if fill_ratio >= 0.3 and fill_ratio < 0.9:
+		score += 30.0
+	elif fill_ratio >= 0.1 and fill_ratio < 0.3:
+		score += 15.0
+	elif fill_ratio >= 0.9:
+		score -= 10.0
+	
+	score += players * 5.0
+	
+	if players <= 1:
+		score -= 20.0
+	
+	var slots_left = max_players - players
+	if slots_left >= 2:
+		score += 10.0
+	elif slots_left == 1:
+		score += 5.0
+	else:
+		score -= 50.0
+	
+	var lobby_age = Steam.getLobbyData(lobby["id"], "created_at").to_int()
+	if lobby_age > 0:
+		var current_time = Time.get_unix_time_from_system()
+		var age_seconds = current_time - lobby_age
+		if age_seconds < 300:
+			score += 20.0
+		elif age_seconds < 600:
+			score += 10.0
+	
+	return score
+
+#endregion ---------------------------------------------------------
+
+
+#region Skill-Based Matchmaking -----------------------------------
+
+func join_lobby_by_skill(skill_range: float = 200.0) -> void:
+	_ensure_instance()
+	if not is_steam_ready or lobby_id != 0:
+		return
+	
+	print("Skill-based matchmaking: fetching lobbies for skill ", player_skill)
+	Steam.addRequestLobbyListStringFilter("game", game_id, Steam.LOBBY_COMPARISON_EQUAL)
+	Steam.addRequestLobbyListDistanceFilter(Steam.LOBBY_DISTANCE_FILTER_WORLDWIDE)
+	Steam.requestLobbyList()
+	
+	if not _instance.lobby_list_received.is_connected(_on_skill_match_list):
+		_instance.lobby_list_received.connect(_on_skill_match_list.bind(skill_range), CONNECT_ONE_SHOT)
+
+func _on_skill_match_list(skill_range: float):
+	if lobby_list.is_empty():
+		print("Skill matchmaking: no lobbies found. Creating one...")
+		host_public_lobby()
+		return
+	
+	var scored_lobbies: Array = []
+	for lobby in lobby_list:
+		var lobby_avg_skill = Steam.getLobbyData(lobby["id"], "avg_skill").to_float()
+		if lobby_avg_skill <= 0:
+			lobby_avg_skill = 500.0
+		
+		var skill_diff = abs(player_skill - lobby_avg_skill)
+		var score: float = _calculate_skill_lobby_score(lobby, skill_diff, skill_range)
+		scored_lobbies.append({
+			"id": lobby["id"], "name": lobby["name"],
+			"players": lobby["players"], "max_players": lobby["max_players"],
+			"avg_skill": lobby_avg_skill, "skill_diff": skill_diff,
+			"score": score
+		})
+	
+	scored_lobbies.sort_custom(func(a, b): return a["score"] > b["score"])
+	
+	print("\n=== Skill Matchmaking Results ===")
+	print("Your skill: ", player_skill)
+	for i in range(min(5, scored_lobbies.size())):
+		var lobby = scored_lobbies[i]
+		print("%d. %s | Skill: %.0f (diff: %.0f) | Players: %d/%d | Score: %.1f" % [
+			i+1, lobby["name"], lobby["avg_skill"], lobby["skill_diff"],
+			lobby["players"], lobby["max_players"], lobby["score"]
+		])
+	print("==================================\n")
+	
+	join_lobby(scored_lobbies[0]["id"])
+
+func _calculate_skill_lobby_score(lobby: Dictionary, skill_diff: float, skill_range: float) -> float:
+	var score: float = 0.0
+	var players: int = lobby["players"]
+	var max_players: int = lobby["max_players"]
+	var fill_ratio: float = float(players) / float(max_players) if max_players > 0 else 0.0
+	
+	if skill_diff <= skill_range * 0.25:
+		score += 50.0
+	elif skill_diff <= skill_range * 0.5:
+		score += 35.0
+	elif skill_diff <= skill_range:
+		score += 20.0
+	else:
+		score -= 30.0
+	
+	if fill_ratio >= 0.3 and fill_ratio < 0.9:
+		score += 15.0
+	elif fill_ratio >= 0.1:
+		score += 8.0
+	
+	score += players * 3.0
+	
+	if players <= 1:
+		score -= 15.0
+	
+	var slots_left = max_players - players
+	if slots_left >= 2:
+		score += 10.0
+	elif slots_left == 1:
+		score += 5.0
+	else:
+		score -= 100.0
+	
+	var lobby_age = Steam.getLobbyData(lobby["id"], "created_at").to_int()
+	if lobby_age > 0:
+		var current_time = Time.get_unix_time_from_system()
+		var age_seconds = current_time - lobby_age
+		if age_seconds < 300:
+			score += 15.0
+		elif age_seconds < 600:
+			score += 8.0
+	
+	return score
 
 #endregion ---------------------------------------------------------
 
 
 #region Steam Callbacks --------------------------------------------
 
-func _on_lobby_created(result : int, lobby_created_id : int) -> void: ## Host callback: Sets up the host peer and tags lobby with game ID
+func _on_lobby_created(result : int, lobby_created_id : int) -> void:
 	_ensure_instance()
 	if result == Steam.Result.RESULT_OK:
 		self.lobby_id = lobby_created_id;
 		
-		# Tag this lobby as belonging to our game
 		Steam.setLobbyData(lobby_created_id, "game", game_id)
 		print("Tagged lobby with game ID: ", game_id)
 		
-		# Set the lobby name if we have a pending one, otherwise use default
+		Steam.setLobbyData(lobby_created_id, "created_at", str(Time.get_unix_time_from_system()))
+		print("Set lobby creation timestamp")
+		
 		if _pending_lobby_name != "":
 			Steam.setLobbyData(lobby_created_id, "name", _pending_lobby_name)
 			print("Set lobby name to: ", _pending_lobby_name)
@@ -505,7 +847,6 @@ func _on_lobby_created(result : int, lobby_created_id : int) -> void: ## Host ca
 		else:
 			Steam.setLobbyData(lobby_created_id, "name", "Lobby " + str(lobby_created_id))
 		
-		# Check if we're in the tree, if not set flag for later
 		if is_inside_tree():
 			_finish_lobby_setup()
 		else:
@@ -513,10 +854,9 @@ func _on_lobby_created(result : int, lobby_created_id : int) -> void: ## Host ca
 	else:
 		print("Failed to create lobby: ", result)
 
-func _on_lobby_joined(lobby_id_joined: int, permissions: int, locked: bool, response: int) -> void: ## Client callback: Handles lobby join response and queues client peer setup
+func _on_lobby_joined(lobby_id_joined: int, permissions: int, locked: bool, response: int) -> void:
 	print("Joined lobby: ", lobby_id_joined)
 	
-	# Verify this lobby belongs to our game before fully joining
 	var lobby_game_id = Steam.getLobbyData(lobby_id_joined, "game")
 	if lobby_game_id != game_id:
 		print("Warning: Joining lobby from different game: ", lobby_game_id, " (expected: ", game_id, ")")
@@ -531,7 +871,6 @@ func _on_lobby_joined(lobby_id_joined: int, permissions: int, locked: bool, resp
 		var member_count = Steam.getNumLobbyMembers(lobby_id_joined)
 		print("Lobby: ", lobby_name, " | Members: ", member_count)
 		
-		# Get host ID and queue client setup
 		var host_id = Steam.getLobbyOwner(lobby_id_joined)
 		if host_id != 0:
 			print("Host Steam ID: ", host_id)
@@ -540,6 +879,7 @@ func _on_lobby_joined(lobby_id_joined: int, permissions: int, locked: bool, resp
 		else:
 			print("Error: Could not get lobby owner")
 		
+		update_lobby_skill()
 		lobby_joined.emit("joined")
 	else:
 		var fail_reason: String
@@ -559,7 +899,7 @@ func _on_lobby_joined(lobby_id_joined: int, permissions: int, locked: bool, resp
 		print("Failed to join lobby: ", fail_reason)
 		self.lobby_id = 0
 
-func _on_lobby_match_list(lobbies: Array) -> void: ## Receives, stores, and emits signal with the list of lobbies found from search
+func _on_lobby_match_list(lobbies: Array) -> void:
 	print("Found ", lobbies.size(), " lobbies for game: ", game_id)
 	
 	lobby_list.clear()
@@ -582,11 +922,11 @@ func _on_lobby_match_list(lobbies: Array) -> void: ## Receives, stores, and emit
 	
 	lobby_list_received.emit()
 
-func _on_lobby_data_update(success: bool, lobby_id_updated: int, member_id: int) -> void: ## Callback: Triggers when any lobby member updates lobby data or metadata
+func _on_lobby_data_update(success: bool, lobby_id_updated: int, member_id: int) -> void:
 	if success:
 		print("Lobby data updated for lobby: ", lobby_id_updated)
 
-func _on_lobby_chat_message(lobby_id_chat: int, user: int, message: String, chat_type: int) -> void: ## Callback: Processes incoming lobby chat messages
+func _on_lobby_chat_message(lobby_id_chat: int, user: int, message: String, chat_type: int) -> void:
 	if message.is_empty():
 		return
 	
@@ -597,13 +937,15 @@ func _on_lobby_chat_message(lobby_id_chat: int, user: int, message: String, chat
 	print("Chat from ", sender_name, ": ", message)
 	lobby_chat_received.emit(sender_name, message)
 
-func _on_lobby_chat_update(lobby_id_chat: int, user_joined: int, user_left: int, user_made_change: int, member_state: int) -> void: ## Callback: Tracks member joins, leaves, and changes
+func _on_lobby_chat_update(lobby_id_chat: int, user_joined: int, user_left: int, user_made_change: int, member_state: int) -> void:
 	if user_joined != 0:
 		print("Member joined: ", Steam.getFriendPersonaName(user_joined))
 		lobby_member_joined.emit(user_joined)
+		update_lobby_skill()
 	if user_left != 0:
 		print("Member left: ", Steam.getFriendPersonaName(user_left))
 		lobby_member_left.emit(user_left)
+		update_lobby_skill()
 	if user_made_change != 0:
 		print("Member changed state: ", Steam.getFriendPersonaName(user_made_change), " state: ", member_state)
 		lobby_member_data_changed.emit(user_made_change, "state", str(member_state))
@@ -613,23 +955,29 @@ func _on_lobby_chat_update(lobby_id_chat: int, user_joined: int, user_left: int,
 
 #region Game Connection Setup --------------------------------------
 
-func _add_player(id : int = 1) -> void: ## Host function: Spawns a player scene for a connected peer, called when a player joins the game
+func _add_player(id : int = 1) -> void:
 	_ensure_instance()
+	if player_scene == null:
+		print("Player ", id, " connected - no player_scene set, emitting signal only")
+		player_connected.emit(id)
+		return
 	var player = player_scene.instantiate();
 	player.name = str(id);
 	call_deferred("add_child", player)
 	print("Player added with ID: ", id)
+	player_connected.emit(id)
 
-func _remove_player(id : int) -> void: ## Host function: Removes a player's scene when they disconnect from the game
+func _remove_player(id : int) -> void:
 	_ensure_instance()
+	player_disconnected.emit(id)
 	if !self.has_node(str(id)):
 		return
-	
 	self.get_node(str(id)).queue_free();
 	print("Player removed with ID: ", id)
 
-func _finish_lobby_setup() -> void: ## Sets up the game as Host using SteamMultiplayerPeer
-	_setup_spawner()
+func _finish_lobby_setup() -> void:
+	if player_scene != null:
+		_setup_spawner()
 
 	peer = SteamMultiplayerPeer.new()
 	peer.create_host(0)
@@ -642,11 +990,12 @@ func _finish_lobby_setup() -> void: ## Sets up the game as Host using SteamMulti
 		tree.multiplayer.peer_connected.connect(_add_player)
 		tree.multiplayer.peer_disconnected.connect(_remove_player)
 		_add_player()
+		update_lobby_skill()
 		lobby_created.emit("created")
 	else:
 		print("Error: Failed to get tree for host setup")
 
-func _finish_client_setup(host_id: int) -> void: ## Creates the client peer when we're safely in the tree
+func _finish_client_setup(host_id: int) -> void:
 	print("Finishing client setup for host: ", host_id)
 	
 	peer = SteamMultiplayerPeer.new()
@@ -659,7 +1008,7 @@ func _finish_client_setup(host_id: int) -> void: ## Creates the client peer when
 	else:
 		print("Error: Could not get scene tree for client setup")
 
-func _leave_lobby() -> void: ## Instance method that handles the actual lobby leaving and multiplayer cleanup
+func _leave_lobby() -> void:
 	if lobby_id != 0:
 		Steam.leaveLobby(lobby_id)
 		print("Left lobby: ", lobby_id)
