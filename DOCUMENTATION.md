@@ -1,5 +1,5 @@
 # ChillSteamPlugin API Reference
-Generated: 2026-04-28
+Generated: 2026-05-10
 
 A custom version of the GodotSteam plugin, made to be comptaible with ChillCube's developer tools and made with specific features for ChillCube
 
@@ -16,12 +16,15 @@ A custom version of the GodotSteam plugin, made to be comptaible with ChillCube'
 | **_pending_lobby_setup** | `bool` | `false` | Flag to delay lobby setup until we're in the tree |
 | **_pending_client_setup** | `bool` | `false` | Flag to delay client setup until we're in the tree |
 | **_pending_host_id** | `int` | `0` | Stored host ID for pending client setup |
+| **_pending_client_player_spawn** | `bool` | `false` | Poll each frame until unique_id is assigned, then spawn local player |
+| **_steam_id_to_peer_id** | `Dictionary` | `{}` | Maps Steam ID → multiplayer peer_id for lobby-data-based spawn sync |
 | **player_skill** | `float` | `500.0` | Player skill rating (1-5000), starts neutral at 500 |
 | **use_skill_matchmaking** | `bool` | `false` | Set to true to enable skill-based matching |
 | **skill_falloff_enabled** | `bool` | `false` | Set to true to enable skill decay over time |
 | **skill_falloff_amount** | `float` | `10.0` | How much skill is lost per falloff tick |
 | **skill_falloff_interval_days** | `int` | `7` | Days between falloff ticks |
 | **skill_falloff_minimum** | `float` | `100.0` | Skill won't decay below this level |
+| **parts** | `` | `message.substr(7).split("")` | strip "__POS__" |
 
 ### 🔔 Signals
 | Signal | Arguments | Description |
@@ -40,7 +43,7 @@ A custom version of the GodotSteam plugin, made to be comptaible with ChillCube'
 ### 🛠️ Methods
 | Method | Arguments | Returns | Description |
 | :--- | :--- | :--- | :--- |
-| **static func initialize_steam()** | `p_scene : PackedScene = null` | `void` |  Sets up Steam with the app ID. Player scene is optional. |
+| **static func initialize_steam()** | `p_scene : PackedScene`<br>`root_node : Node` | `void` |  Sets up Steam with the app ID. Player scene is optional. |
 | **static func _ensure_instance()** | - | `void` |  Creates the singleton SteamManager node and adds it to the scene tree if it doesn't exist |
 | **static func get_instance()** | - | `SteamManager` |  Returns the SteamManager instance for connecting signals |
 | **static func set_player_scene()** | `p_scene: PackedScene` | `void` |  Sets the player scene after initialization |

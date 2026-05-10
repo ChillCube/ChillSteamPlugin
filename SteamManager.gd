@@ -10,6 +10,7 @@ static var _instance : SteamManager
 static var peer : SteamMultiplayerPeer;
 static var player_scene : PackedScene = null;
 static var initialized : bool = false;
+static var scene_tree_root : Node;
 
 static var spawner : MultiplayerSpawner;
 static var lobby_list : Array = []  ## Stores the list of found lobbies
@@ -22,6 +23,10 @@ var _spawnable_scenes : Array[PackedScene] = []  ## Stores scenes for custom spa
 var _pending_lobby_setup : bool = false  ## Flag to delay lobby setup until we're in the tree
 var _pending_client_setup : bool = false  ## Flag to delay client setup until we're in the tree
 var _pending_host_id : int = 0  ## Stored host ID for pending client setup
+var _pending_client_player_spawn : bool = false  ## Poll each frame until unique_id is assigned, then spawn local player
+var _steam_id_to_peer_id : Dictionary = {}  ## Maps Steam ID → multiplayer peer_id for lobby-data-based spawn sync
+var _last_lobby_pos_sync : float = 0.0
+const _LOBBY_POS_SYNC_INTERVAL : float = 0.05  ## 20Hz position broadcast via lobby messages
 
 ## Skill system - defaults work out of the box, no setup needed
 static var player_skill : float = 500.0  ## Player skill rating (1-5000), starts neutral at 500
@@ -47,8 +52,9 @@ signal player_connected(id: int)  ## A player connected to the multiplayer peer
 signal player_disconnected(id: int)  ## A player disconnected from the multiplayer peer
 
 #region Initialize the Steam Manager -----------------------------
-static func initialize_steam(p_scene : PackedScene = null) -> void: ## Sets up Steam with the app ID. Player scene is optional.
+static func initialize_steam(p_scene : PackedScene, root_node : Node) -> void: ## Sets up Steam with the app ID. Player scene is optional.
 	if not initialized:
+		scene_tree_root = root_node
 		player_scene = p_scene
 		
 		game_id = ProjectSettings.get_setting("application/config/name", "UnknownGame")
@@ -78,14 +84,17 @@ static func initialize_steam(p_scene : PackedScene = null) -> void: ## Sets up S
 		is_steam_ready = true
 
 static func _ensure_instance() -> void: ## Creates the singleton SteamManager node and adds it to the scene tree if it doesn't exist
-	if _instance == null:
+	if _instance == null and scene_tree_root != null:
 		_instance = SteamManager.new()
 		_instance.name = "SteamManager"
-		
-		var root = Engine.get_main_loop().root
-		root.add_child(_instance)
-		
-		print("SteamManager added to root viewport")
+		print("[SteamManager] scene_tree_root: ", scene_tree_root, " | is_inside_tree: ", scene_tree_root.is_inside_tree())
+		print("[SteamManager] Calling call_deferred(add_child) on scene_tree_root...")
+		scene_tree_root.call_deferred("add_child", _instance)
+		print("[SteamManager] After call_deferred - _instance.is_inside_tree(): ", _instance.is_inside_tree())
+		print("Scene Tree Root: " + str(scene_tree_root))
+		print("Instance: " + str(_instance))
+		print("Instance Path (will be empty until deferred add_child runs): " + str(_instance.get_path()))
+		print("SteamManager queued for addition to root viewport")
 		_instance._setup_callbacks()
 
 static func get_instance() -> SteamManager: ## Returns the SteamManager instance for connecting signals
@@ -96,7 +105,11 @@ static func set_player_scene(p_scene: PackedScene) -> void: ## Sets the player s
 	player_scene = p_scene
 	print("Player scene set")
 
+func _enter_tree() -> void:
+	print("[SteamManager] _enter_tree() - path: ", get_path())
+
 func _ready() -> void: ## Called when node enters scene tree - handle any pending setups
+	print("[SteamManager] _ready() - path: ", get_path())
 	if _pending_lobby_setup:
 		_pending_lobby_setup = false
 		_finish_lobby_setup()
@@ -111,6 +124,21 @@ func _process(_delta) -> void: ## Check for pending setups each frame as fallbac
 	if _pending_client_setup and is_inside_tree():
 		_pending_client_setup = false
 		_finish_client_setup(_pending_host_id)
+	if lobby_id != 0:
+		var now := Time.get_ticks_msec() / 1000.0
+		if now - _last_lobby_pos_sync >= _LOBBY_POS_SYNC_INTERVAL:
+			_last_lobby_pos_sync = now
+			_broadcast_position_via_lobby()
+	if _pending_client_player_spawn and is_inside_tree():
+		var uid := multiplayer.get_unique_id()
+		if uid > 1:  ## uid==0 means not connected yet, uid==1 means we are the server
+			_pending_client_player_spawn = false
+			print("[SteamManager] Client connected with id ", uid, ", spawning own player locally")
+			_rpc_spawn_player(uid)
+			Steam.setLobbyMemberData(lobby_id, "peer_id", str(uid))
+			print("[SteamManager] Published peer_id=", uid, " to lobby member data")
+			_sync_players_from_lobby()   ## Immediately pick up host and any existing players
+			_request_spawn.rpc_id(1)     ## Also try RPC path (works on real different-account setups)
 
 func _setup_callbacks() -> void: ## Connects all Steam lobby signals to their handler functions for both host and client
 	Steam.lobby_created.connect(_on_lobby_created)
@@ -126,24 +154,25 @@ func _setup_spawner(auto_spawn_scenes : Array[PackedScene] = []) -> void: ## Cre
 	if player_scene == null:
 		print("No player_scene set, skipping MultiplayerSpawner")
 		return
-	
+
 	spawner = MultiplayerSpawner.new()
 	spawner.name = "PlayerSpawner"
-	spawner.spawn_path = NodePath("/root")
+	spawner.spawn_path = get_path()  ## Players are children of SteamManager; must match on all peers
 	spawner.spawn_function = _spawn_custom
-	
+
 	_spawnable_scenes = [player_scene]
 	for scene in auto_spawn_scenes:
 		if not _spawnable_scenes.has(scene):
 			_spawnable_scenes.append(scene)
-	
-	add_child(spawner)
-	print("MultiplayerSpawner setup complete")
 
-func _spawn_custom(data) -> Node: ## Custom spawn function for MultiplayerSpawner
-	if data is int and data < _spawnable_scenes.size():
-		return _spawnable_scenes[data].instantiate()
-	return null
+	add_child(spawner)
+	print("MultiplayerSpawner setup complete, spawn_path: ", get_path())
+
+func _spawn_custom(data) -> Node: ## Custom spawn function for MultiplayerSpawner — data is the peer ID
+	var player = player_scene.instantiate()
+	player.name = str(data)
+	player.set_multiplayer_authority(int(data))  ## Each player owns their own node
+	return player
 
 func add_to_autospawn(scene: PackedScene) -> void: ## Adds additional scenes to the spawn list for network synchronization
 	if not _spawnable_scenes.has(scene):
@@ -883,11 +912,11 @@ func _on_lobby_joined(lobby_id_joined: int, permissions: int, locked: bool, resp
 
 		var host_id = Steam.getLobbyOwner(lobby_id_joined)
 		if host_id != 0:
-			print("Host Steam ID: ", host_id)
-			if host_id != Steam.getSteamID():
-				is_host = false
+			print("Host Steam ID: ", host_id, " | is_host: ", is_host)
+			if not is_host:
 				_pending_host_id = host_id
 				_pending_client_setup = true
+				print("Setting up as client, connecting to host peer: ", host_id)
 			else:
 				print("We are the host, skipping client peer setup")
 		else:
@@ -937,13 +966,16 @@ func _on_lobby_match_list(lobbies: Array) -> void:
 	lobby_list_received.emit()
 
 func _on_lobby_data_update(success: bool, lobby_id_updated: int, member_id: int) -> void:
-	if success:
-		print("Lobby data updated for lobby: ", lobby_id_updated)
+	if success and lobby_id_updated == lobby_id:
+		_sync_players_from_lobby()
 
 func _on_lobby_chat_message(lobby_id_chat: int, user: int, message: String, chat_type: int) -> void:
+	if message.begins_with("__POS__"):
+		_apply_lobby_position_sync(message)
+		return
 	if message.is_empty():
 		return
-	
+
 	var sender_name: String = Steam.getFriendPersonaName(user)
 	if sender_name == "":
 		sender_name = "Player " + str(user)
@@ -960,6 +992,10 @@ func _on_lobby_chat_update(lobby_id_chat: int, user_joined: int, user_left: int,
 		print("Member left: ", Steam.getFriendPersonaName(user_left))
 		lobby_member_left.emit(user_left)
 		update_lobby_skill()
+		if _steam_id_to_peer_id.has(user_left):
+			var departed_peer_id: int = _steam_id_to_peer_id[user_left]
+			_steam_id_to_peer_id.erase(user_left)
+			_remove_player(departed_peer_id)
 	if user_made_change != 0:
 		print("Member changed state: ", Steam.getFriendPersonaName(user_made_change), " state: ", member_state)
 		lobby_member_data_changed.emit(user_made_change, "state", str(member_state))
@@ -969,17 +1005,104 @@ func _on_lobby_chat_update(lobby_id_chat: int, user_joined: int, user_left: int,
 
 #region Game Connection Setup --------------------------------------
 
-func _add_player(id : int = 1) -> void:
-	_ensure_instance()
+@rpc("authority", "call_local", "reliable")
+func _rpc_spawn_player(id: int) -> void:  ## Host broadcasts this to all peers including itself
+	print("[_rpc_spawn_player] called — id=", id, " | my_uid=", multiplayer.get_unique_id(), " | is_server=", multiplayer.is_server())
+	if has_node(str(id)):
+		print("[_rpc_spawn_player] already have node ", id, ", skipping")
+		return
 	if player_scene == null:
-		print("Player ", id, " connected - no player_scene set, emitting signal only")
 		player_connected.emit(id)
 		return
-	var player = player_scene.instantiate();
-	player.name = str(id);
-	call_deferred("add_child", player)
-	print("Player added with ID: ", id)
+	var player = player_scene.instantiate()
+	player.name = str(id)
+	player.set_multiplayer_authority(id)
+	add_child(player)
+	print("[_rpc_spawn_player] spawned player ", id)
 	player_connected.emit(id)
+
+func _broadcast_position_via_lobby() -> void:
+	var my_uid := multiplayer.get_unique_id()
+	if my_uid == 0 or not has_node(str(my_uid)):
+		return
+	var player := get_node(str(my_uid))
+	var pos : Vector2 = player.position
+	var vel : Vector2 = player.velocity if player is CharacterBody2D else Vector2.ZERO
+	Steam.sendLobbyChatMsg(lobby_id, "__POS__%d:%.1f:%.1f:%.1f:%.1f" % [my_uid, pos.x, pos.y, vel.x, vel.y])
+
+func _apply_lobby_position_sync(message: String) -> void:
+	if peer == null:
+		return  ## Multiplayer not yet established — skip
+	var parts := message.substr(7).split(":")  ## strip "__POS__"
+	if parts.size() < 3:
+		return
+	var peer_id := int(parts[0])
+	var my_uid := multiplayer.get_unique_id()
+	if peer_id == my_uid:
+		return  ## ignore our own broadcast
+	## Before the server assigns us an id, get_unique_id() returns 1 — the same value as the
+	## host's peer id. If we acted on that, node "1" would be created with _is_local_player=true.
+	## Wait until we have a real assigned uid (> 1) unless we actually are the host.
+	if not is_host and my_uid == 1:
+		return
+	var player_node := get_node_or_null(str(peer_id))
+	if player_node == null:
+		## Received a position from a peer we don't have a node for yet.
+		## Spawn it now — lobby messages are reliable even for same-account P2P.
+		print("[POS_SYNC] auto-spawning missing peer=", peer_id, " from position broadcast")
+		_rpc_spawn_player(peer_id)
+		player_node = get_node_or_null(str(peer_id))
+		if player_node == null:
+			return
+	var pos := Vector2(float(parts[1]), float(parts[2]))
+	if player_node is Node2D:
+		## Use set() because player_node is typed as Node — direct property access won't compile
+		if player_node.get("_net_position") != null:
+			player_node.set("_net_position", pos)
+		else:
+			(player_node as Node2D).position = pos
+
+func _sync_players_from_lobby() -> void:
+	## Reads every lobby member's "peer_id" slot and locally spawns anyone missing.
+	## Works even when Steam P2P is broken (same account), because lobby data is relayed by Steam.
+	if lobby_id == 0 or not is_inside_tree():
+		return
+	if peer == null:
+		## Multiplayer peer not yet established — get_unique_id() returns the default 1
+		## and would cause player nodes to be created with wrong authority settings.
+		return
+	var my_uid := multiplayer.get_unique_id()
+	if my_uid == 0:
+		return
+	## Same transient-uid problem: clients show uid=1 before the server assigns their real id.
+	if not is_host and my_uid == 1:
+		return
+	for member_steam_id in get_lobby_members():
+		var peer_id_str := Steam.getLobbyMemberData(lobby_id, member_steam_id, "peer_id")
+		if peer_id_str == "" or not peer_id_str.is_valid_int():
+			continue
+		var peer_id := int(peer_id_str)
+		_steam_id_to_peer_id[member_steam_id] = peer_id
+		if peer_id > 0 and not has_node(str(peer_id)):
+			print("[_sync_players_from_lobby] spawning missing peer_id=", peer_id, " (steam_id=", member_steam_id, ")")
+			_rpc_spawn_player(peer_id)
+
+func _add_player(id : int = 1) -> void:
+	print("[_add_player] called — id=", id, " | my_uid=", multiplayer.get_unique_id(), " | is_server=", multiplayer.is_server())
+	_ensure_instance()
+	if has_node(str(id)):
+		print("[_add_player] player ", id, " already exists, skipping")
+		return
+	if player_scene == null:
+		print("[_add_player] no player_scene, emitting signal only")
+		player_connected.emit(id)
+		return
+	if multiplayer.is_server():
+		print("[_add_player] server — calling _rpc_spawn_player.rpc(", id, ")")
+		_rpc_spawn_player.rpc(id)  ## Broadcasts to all peers including host (call_local)
+	else:
+		print("[_add_player] client — calling _rpc_spawn_player.rpc_id(1, ", id, ")")
+		_rpc_spawn_player.rpc_id(1, id)  ## Ask server to broadcast the spawn
 
 func _remove_player(id : int) -> void:
 	_ensure_instance()
@@ -990,7 +1113,7 @@ func _remove_player(id : int) -> void:
 	print("Player removed with ID: ", id)
 
 func _finish_lobby_setup() -> void:
-	if player_scene != null:
+	if spawner == null:
 		_setup_spawner()
 
 	peer = SteamMultiplayerPeer.new()
@@ -998,29 +1121,72 @@ func _finish_lobby_setup() -> void:
 
 	host_steam_id = Steam.getSteamID()
 
-	var tree = get_tree()
-	if tree:
-		tree.multiplayer.multiplayer_peer = peer
-		tree.multiplayer.peer_connected.connect(_add_player)
-		tree.multiplayer.peer_disconnected.connect(_remove_player)
+	if is_inside_tree():
+		multiplayer.multiplayer_peer = peer
+		multiplayer.peer_connected.connect(_add_player)
+		multiplayer.peer_disconnected.connect(_remove_player)
+		print("[_finish_lobby_setup] peer_connected signal connected — waiting for clients")
 		_add_player()
+		Steam.setLobbyMemberData(lobby_id, "peer_id", "1")
+		print("[_finish_lobby_setup] published peer_id=1 to lobby member data")
 		update_lobby_skill()
 		lobby_created.emit("created")
 	else:
-		print("Error: Failed to get tree for host setup")
+		print("Error: SteamManager not in scene tree for host setup")
 
 func _finish_client_setup(host_id: int) -> void:
 	print("Finishing client setup for host: ", host_id)
-	
+
 	peer = SteamMultiplayerPeer.new()
 	peer.create_client(host_id, 0)
 
-	var tree = get_tree()
-	if tree:
-		tree.multiplayer.multiplayer_peer = peer
-		print("Client peer setup complete, connected to host ", host_id)
+	if is_inside_tree():
+		multiplayer.multiplayer_peer = peer
+		multiplayer.peer_disconnected.connect(_remove_player)
+		multiplayer.connected_to_server.connect(_on_connected_to_server, CONNECT_ONE_SHOT)
+		_pending_client_player_spawn = true
+		print("Client peer setup complete, connecting to host ", host_id)
 	else:
-		print("Error: Could not get scene tree for client setup")
+		print("Error: SteamManager not in scene tree for client setup")
+
+@rpc("any_peer", "reliable")
+func _request_spawn() -> void:  ## Client calls this; host spawns them on all peers and replays existing players
+	print("[_request_spawn] received — is_server=", multiplayer.is_server(), " sender=", multiplayer.get_remote_sender_id())
+	if not multiplayer.is_server():
+		return
+	var peer_id := multiplayer.get_remote_sender_id()
+	print("[_request_spawn] host handling request from peer ", peer_id)
+	_rpc_spawn_player.rpc(peer_id)  ## Spawn new client's player on everyone
+	## Replay all already-spawned players to the new client so they see existing players
+	for child in get_children():
+		if child.name.is_valid_int():
+			var existing_id := int(child.name)
+			if existing_id != peer_id:
+				print("[_request_spawn] replaying existing player ", existing_id, " to peer ", peer_id)
+				_rpc_spawn_player.rpc_id(peer_id, existing_id)
+				## Send current position immediately so the new client doesn't see them at origin
+				if child is Node2D:
+					_rpc_set_player_position.rpc_id(peer_id, existing_id, (child as Node2D).position)
+
+@rpc("authority", "reliable")
+func _rpc_set_player_position(player_id: int, pos: Vector2) -> void:  ## Sets initial position for a spawned player
+	var node := get_node_or_null(str(player_id))
+	if node == null:
+		return
+	if node.get("_net_position") != null:
+		node.set("_net_position", pos)
+	if node is Node2D:
+		(node as Node2D).position = pos
+
+func _on_connected_to_server() -> void:
+	_pending_client_player_spawn = false  ## Cancel poll-based fallback
+	var uid := multiplayer.get_unique_id()
+	print("Connected to server (signal), uid=", uid, " — spawning own player locally and requesting host replay")
+	_rpc_spawn_player(uid)       ## Always spawn own player locally
+	Steam.setLobbyMemberData(lobby_id, "peer_id", str(uid))  ## Ensure lobby-data path can see us
+	print("[_on_connected_to_server] Published peer_id=", uid, " to lobby member data")
+	_sync_players_from_lobby()   ## Pick up host and any existing players via lobby data
+	_request_spawn.rpc_id(1)    ## Ask host to broadcast existing players
 
 func _leave_lobby() -> void:
 	if lobby_id != 0:
@@ -1028,11 +1194,10 @@ func _leave_lobby() -> void:
 		print("Left lobby: ", lobby_id)
 		lobby_id = 0
 		is_host = false
-		
-		var tree = get_tree()
-		if tree and tree.multiplayer.multiplayer_peer:
-			tree.multiplayer.multiplayer_peer.close()
-			tree.multiplayer.multiplayer_peer = null
+
+		if is_inside_tree() and multiplayer.multiplayer_peer:
+			multiplayer.multiplayer_peer.close()
+			multiplayer.multiplayer_peer = null
 		peer = null
 
 #endregion ---------------------------------------------------------
