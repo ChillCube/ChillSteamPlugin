@@ -54,17 +54,28 @@ static func initialize_steam(p_scene : PackedScene = null) -> void: ## Sets up S
 		game_id = ProjectSettings.get_setting("application/config/name", "UnknownGame")
 		print("Game ID set to: ", game_id)
 		
-		print("Steam initialized", Steam.steamInit(app_id, true))
-		Steam.initRelayNetworkAccess();
+		var steam_result = Steam.steamInit(app_id, true)
+		print("Steam initialized: ", steam_result)
+
+		var steam_ok: bool
+		if steam_result is Dictionary:
+			steam_ok = steam_result.get("status", 0) == 1
+		else:
+			steam_ok = bool(steam_result)
+
+		initialized = true
+
+		if not steam_ok:
+			print("Steam failed to initialize. Make sure Steam is running and steam_appid.txt exists.")
+			return
+
+		Steam.initRelayNetworkAccess()
 		_ensure_instance()
-		Steam.lobby_created.connect(_instance._on_lobby_created)
-		
-		# Load saved skill and apply any falloff
+
 		_instance.load_skill()
 		_instance._apply_skill_falloff()
-		
-		initialized = true;
-		is_steam_ready = true;
+
+		is_steam_ready = true
 
 static func _ensure_instance() -> void: ## Creates the singleton SteamManager node and adds it to the scene tree if it doesn't exist
 	if _instance == null:
@@ -845,7 +856,7 @@ func _on_lobby_created(result : int, lobby_created_id : int) -> void:
 			print("Set lobby name to: ", _pending_lobby_name)
 			_pending_lobby_name = ""
 		else:
-			Steam.setLobbyData(lobby_created_id, "name", "Lobby " + str(lobby_created_id))
+			Steam.setLobbyData(lobby_created_id, "name", Steam.getFriendPersonaName(Steam.getSteamID()) + "'s Lobby")
 		
 		if is_inside_tree():
 			_finish_lobby_setup()
@@ -862,20 +873,23 @@ func _on_lobby_joined(lobby_id_joined: int, permissions: int, locked: bool, resp
 		print("Warning: Joining lobby from different game: ", lobby_game_id, " (expected: ", game_id, ")")
 	
 	self.lobby_id = lobby_id_joined
-	is_host = false
-	
+
 	if response == Steam.CHAT_ROOM_ENTER_RESPONSE_SUCCESS:
 		print("Successfully entered lobby chat room")
-		
+
 		var lobby_name = Steam.getLobbyData(lobby_id_joined, "name")
 		var member_count = Steam.getNumLobbyMembers(lobby_id_joined)
 		print("Lobby: ", lobby_name, " | Members: ", member_count)
-		
+
 		var host_id = Steam.getLobbyOwner(lobby_id_joined)
 		if host_id != 0:
 			print("Host Steam ID: ", host_id)
-			_pending_host_id = host_id
-			_pending_client_setup = true
+			if host_id != Steam.getSteamID():
+				is_host = false
+				_pending_host_id = host_id
+				_pending_client_setup = true
+			else:
+				print("We are the host, skipping client peer setup")
 		else:
 			print("Error: Could not get lobby owner")
 		
