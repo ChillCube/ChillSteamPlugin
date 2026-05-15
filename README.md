@@ -11,8 +11,6 @@ To add this to your project, copy paste these commands into terminal at the root
 ```bash
 clone-gd-addon https://github.com/ChillCube/ChillSteamPlugin.git
 ```
-> [!IMPORTANT]
-> Make sure to enable the addon, including its dependencies in the project settings!
 
 ## Documentation
 You can find the documentation at: https://github.com/ChillCube/ChillSteamPlugin/blob/main/DOCUMENTATION.md
