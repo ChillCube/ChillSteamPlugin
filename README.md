@@ -9,7 +9,7 @@ Make sure to download the ChillCube Developer tools to use this addon: https://g
 ### Linux
 To add this to your project, copy paste these commands into terminal at the root of your project:
 ```bash
-clone-gd-addon https://github.com/ChillCube/ChillSteamPlugin.git
+clone-gd-addon git@github.com:ChillCube/ChillSteamPlugin.git
 ```
 > [!IMPORTANT]
 > Make sure to enable the addon, including its dependencies in the project settings!
