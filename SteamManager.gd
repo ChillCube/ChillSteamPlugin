@@ -1,3 +1,4 @@
+@icon("res://addons/ChillSteamPlugin/editor/ui/steam.svg")
 extends Node
 class_name SteamManager
 
