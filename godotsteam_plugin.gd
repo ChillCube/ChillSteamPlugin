@@ -16,31 +16,31 @@ static func get_dock_frame() -> Control:
 	return dock_frame
 
 
-func _enable_plugin() -> void:
+func _enable_plugin() -> void: ## Called by the editor when this plugin is enabled; prints a confirmation message
 	print("GodotSteam GDExtension updater functionality enabled")
 
 
-func _disable_plugin() -> void:
+func _disable_plugin() -> void: ## Called by the editor when this plugin is disabled; prints a confirmation message
 	print("GodotSteam GDEXtension updater functionality disabled")
 
 
-func _enter_tree() -> void:
+func _enter_tree() -> void: ## Prints the GodotSteam version banner and sets up project settings and the Steamworks dock
 	print_rich("GodotSteam v%s | %s | %s" % [Steam.get_godotsteam_version(), link_website, link_changelog])
 	add_project_settings()
 	add_steamworks_dock()
 
 
-func _exit_tree() -> void:
+func _exit_tree() -> void: ## Removes the Steamworks dock panel when the plugin is unloaded
 	remove_steamworks_dock()
 
 
-func _make_visible(visible) -> void:
+func _make_visible(visible) -> void: ## Shows or hides the Steamworks dock panel
 	if steamworks_dock:
 		steamworks_dock.set_visible(visible)
 
 
 #region Add and remove things
-func add_project_settings() -> void:
+func add_project_settings() -> void: ## Registers Steam update-channel project settings with sensible defaults if they don't already exist
 	# Used for the Updater looking for redist files and SteamCMD
 	if not ProjectSettings.has_setting("steam/updates/godotsteam/check_for_updates"):
 		ProjectSettings.set_setting("steam/updates/godotsteam/check_for_updates", true)
@@ -65,7 +65,7 @@ func add_project_settings() -> void:
 	ProjectSettings.set_as_basic("steam/updates/godotsteam/update_channel", true)
 
 
-func add_steamworks_dock() -> void:
+func add_steamworks_dock() -> void: ## Instantiates the Steamworks editor panel and adds it to the bottom dock
 	steamworks_dock = EDITOR_PANEL.instantiate()
 	# This will be used when 4.4.x is deprecated
 	#add_control_to_dock(DockSlot.DOCK_SLOT_BOTTOM, steamworks_dock)
@@ -74,7 +74,7 @@ func add_steamworks_dock() -> void:
 	dock_frame = steamworks_dock
 
 
-func remove_steamworks_dock() -> void:
+func remove_steamworks_dock() -> void: ## Removes the Steamworks panel from the bottom dock and frees it
 	# This will be used when 4.4.x is deprecated
 	#remove_control_from_docks(steamworks_dock)
 	# This is deprecated as of 4.6; when it is removed then 4.4.x will be deprecated for GodotSteam

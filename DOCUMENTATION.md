@@ -1,5 +1,5 @@
 # ChillSteamPlugin API Reference
-Generated: 2026-05-10
+Generated: 2026-05-20
 
 A custom version of the GodotSteam plugin, made to be comptaible with ChillCube's developer tools and made with specific features for ChillCube
 
@@ -139,6 +139,13 @@ A custom version of the GodotSteam plugin, made to be comptaible with ChillCube'
 ## Class: GodotSteamPlugin
 **Inherits:** [EditorPlugin](https://docs.godotengine.org/en/stable/classes/class_editorplugin.html)
 
+
+### 🛠️ Methods
+| Method | Arguments | Returns | Description |
+| :--- | :--- | :--- | :--- |
+| **add_project_settings()** | - | `void` |  Registers Steam update-channel project settings with sensible defaults if they don't already exist |
+| **add_steamworks_dock()** | - | `void` |  Instantiates the Steamworks editor panel and adds it to the bottom dock |
+| **remove_steamworks_dock()** | - | `void` |  Removes the Steamworks panel from the bottom dock and frees it |
 
 ---
 
