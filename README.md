@@ -27,8 +27,3 @@ remove-gd-addon ChillSteamPlugin
 ```bash
 push-all-addons
 ```
-
-## Used By
-1 other ChillCube addon(s) depend on this:
-
-- [SteamLobbyList](https://github.com/ChillCube/SteamLobbyList)
