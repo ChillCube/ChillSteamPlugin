@@ -15,6 +15,7 @@ static var scene_tree_root : Node;
 
 static var spawner : MultiplayerSpawner;
 static var lobby_list : Array = []  ## Stores the list of found lobbies
+static var lobby_max_players : int = 0  ## Set when hosting; written to lobby data so clients can read it
 static var _pending_lobby_name : String = ""  ## Temporary storage for lobby name before creation
 
 ## Unique identifier for this game - uses the project name from ProjectSettings
@@ -25,6 +26,7 @@ var _pending_lobby_setup : bool = false  ## Flag to delay lobby setup until we'r
 var _pending_client_setup : bool = false  ## Flag to delay client setup until we're in the tree
 var _pending_host_id : int = 0  ## Stored host ID for pending client setup
 var _pending_client_player_spawn : bool = false  ## Poll each frame until unique_id is assigned, then spawn local player
+var _lobby_full_fired : bool = false  ## Ensures the needs_lobby_full group is called only once per session
 var _steam_id_to_peer_id : Dictionary = {}  ## Maps Steam ID → multiplayer peer_id for lobby-data-based spawn sync
 var _last_lobby_pos_sync : float = 0.0
 const _LOBBY_POS_SYNC_INTERVAL : float = 0.05  ## 20Hz position broadcast via lobby messages
@@ -47,6 +49,7 @@ signal lobby_list_received  ## Signal to notify when lobby list is ready
 signal lobby_chat_received(sender_name: String, message: String)  ## Chat message received
 signal lobby_data_changed(key: String, value: String, member_id: int)  ## Custom lobby data changed
 signal lobby_member_joined(member_id: int)  ## A member joined the lobby
+signal lobby_full  ## The lobby has reached its maximum capacity
 signal lobby_member_left(member_id: int)  ## A member left the lobby
 signal lobby_member_data_changed(member_id: int, key: String, value: String)  ## A member's data changed
 signal player_connected(id: int)  ## A player connected to the multiplayer peer
@@ -91,10 +94,8 @@ static func _ensure_instance() -> void: ## Creates the singleton SteamManager no
 		print("[SteamManager] scene_tree_root: ", scene_tree_root, " | is_inside_tree: ", scene_tree_root.is_inside_tree())
 		print("[SteamManager] Calling call_deferred(add_child) on scene_tree_root...")
 		scene_tree_root.call_deferred("add_child", _instance)
-		print("[SteamManager] After call_deferred - _instance.is_inside_tree(): ", _instance.is_inside_tree())
 		print("Scene Tree Root: " + str(scene_tree_root))
 		print("Instance: " + str(_instance))
-		print("Instance Path (will be empty until deferred add_child runs): " + str(_instance.get_path()))
 		print("SteamManager queued for addition to root viewport")
 		_instance._setup_callbacks()
 
@@ -139,7 +140,8 @@ func _process(_delta) -> void: ## Check for pending setups each frame as fallbac
 			Steam.setLobbyMemberData(lobby_id, "peer_id", str(uid))
 			print("[SteamManager] Published peer_id=", uid, " to lobby member data")
 			_sync_players_from_lobby()   ## Immediately pick up host and any existing players
-			_request_spawn.rpc_id(1)     ## Also try RPC path (works on real different-account setups)
+			if peer != null and peer.get_connection_status() == MultiplayerPeer.CONNECTION_CONNECTED:
+				_request_spawn.rpc_id(1)     ## Also try RPC path (works on real different-account setups)
 
 func _setup_callbacks() -> void: ## Connects all Steam lobby signals to their handler functions for both host and client
 	Steam.lobby_created.connect(_on_lobby_created)
@@ -226,6 +228,7 @@ static func host_lobby(lobby_type, max_players: int = 4) -> bool: ## Internal fu
 		return false
 	
 	Steam.createLobby(lobby_type, max_players)
+	lobby_max_players = max_players
 	print("Lobby Created")
 	is_host = true;
 	return true
@@ -879,6 +882,7 @@ func _on_lobby_created(result : int, lobby_created_id : int) -> void:
 		print("Tagged lobby with game ID: ", game_id)
 		
 		Steam.setLobbyData(lobby_created_id, "created_at", str(Time.get_unix_time_from_system()))
+		Steam.setLobbyData(lobby_created_id, "max_players", str(lobby_max_players))
 		print("Set lobby creation timestamp")
 		
 		if _pending_lobby_name != "":
@@ -969,6 +973,10 @@ func _on_lobby_match_list(lobbies: Array) -> void:
 func _on_lobby_data_update(success: bool, lobby_id_updated: int, member_id: int) -> void:
 	if success and lobby_id_updated == lobby_id:
 		_sync_players_from_lobby()
+		if not is_host and not _lobby_full_fired:
+			if Steam.getLobbyData(lobby_id, "game_started") == "1":
+				_lobby_full_fired = true
+				get_tree().call_group("needs_lobby_full", "_on_steam_lobby_list_lobby_full", lobby_id)
 
 func _on_lobby_chat_message(lobby_id_chat: int, user: int, message: String, chat_type: int) -> void:
 	if message.begins_with("__POS__"):
@@ -984,22 +992,29 @@ func _on_lobby_chat_message(lobby_id_chat: int, user: int, message: String, chat
 	print("Chat from ", sender_name, ": ", message)
 	lobby_chat_received.emit(sender_name, message)
 
-func _on_lobby_chat_update(lobby_id_chat: int, user_joined: int, user_left: int, user_made_change: int, member_state: int) -> void:
-	if user_joined != 0:
-		print("Member joined: ", Steam.getFriendPersonaName(user_joined))
-		lobby_member_joined.emit(user_joined)
+func _on_lobby_chat_update(lobby_id_chat: int, changed_id: int, making_change_id: int, chat_state: int) -> void:
+	print("[lobby_chat_update] changed_id=", changed_id, " chat_state=", chat_state)
+	## chat_state is EChatMemberStateChange: 1=entered, 2=left, 4=disconnected, 8=kicked, 16=banned
+	if chat_state & 1:  ## entered / joined
+		print("Member joined: ", Steam.getFriendPersonaName(changed_id))
+		lobby_member_joined.emit(changed_id)
 		update_lobby_skill()
-	if user_left != 0:
-		print("Member left: ", Steam.getFriendPersonaName(user_left))
-		lobby_member_left.emit(user_left)
+		var member_count := Steam.getNumLobbyMembers(lobby_id)
+		var max_members := Steam.getLobbyMemberLimit(lobby_id)
+		print("[lobby_chat_update] member_count=", member_count, " max_members=", max_members)
+		if max_members > 0 and member_count >= max_members:
+			lobby_full.emit()
+	if chat_state & ~1:  ## left, disconnected, kicked, or banned
+		print("Member left: ", Steam.getFriendPersonaName(changed_id))
+		lobby_member_left.emit(changed_id)
 		update_lobby_skill()
-		if _steam_id_to_peer_id.has(user_left):
-			var departed_peer_id: int = _steam_id_to_peer_id[user_left]
-			_steam_id_to_peer_id.erase(user_left)
+		if _steam_id_to_peer_id.has(changed_id):
+			var departed_peer_id: int = _steam_id_to_peer_id[changed_id]
+			_steam_id_to_peer_id.erase(changed_id)
 			_remove_player(departed_peer_id)
-	if user_made_change != 0:
-		print("Member changed state: ", Steam.getFriendPersonaName(user_made_change), " state: ", member_state)
-		lobby_member_data_changed.emit(user_made_change, "state", str(member_state))
+	if making_change_id != 0 and making_change_id != changed_id:
+		print("Member state changed by admin: ", Steam.getFriendPersonaName(changed_id), " state: ", chat_state)
+		lobby_member_data_changed.emit(changed_id, "state", str(chat_state))
 
 #endregion ---------------------------------------------------------
 
@@ -1021,12 +1036,26 @@ func _rpc_spawn_player(id: int) -> void:  ## Host broadcasts this to all peers i
 	add_child(player)
 	print("[_rpc_spawn_player] spawned player ", id)
 	player_connected.emit(id)
+	if not _lobby_full_fired:
+		var spawned := get_children().filter(func(c: Node): return c.name.is_valid_int()).size()
+		var limit := Steam.getLobbyMemberLimit(lobby_id)
+		if limit <= 0:
+			limit = lobby_max_players
+		if limit <= 0:
+			limit = int(Steam.getLobbyData(lobby_id, "max_players"))
+		if limit > 0 and spawned >= limit:
+			_lobby_full_fired = true
+			get_tree().call_group("needs_lobby_full", "_on_steam_lobby_list_lobby_full", lobby_id)
+			if is_host:
+				Steam.setLobbyData(lobby_id, "game_started", "1")
 
 func _broadcast_position_via_lobby() -> void:
 	var my_uid := multiplayer.get_unique_id()
 	if my_uid == 0 or not has_node(str(my_uid)):
 		return
 	var player := get_node(str(my_uid))
+	if not player is Node2D:
+		return
 	var pos : Vector2 = player.position
 	var vel : Vector2 = player.velocity if player is CharacterBody2D else Vector2.ZERO
 	Steam.sendLobbyChatMsg(lobby_id, "__POS__%d:%.1f:%.1f:%.1f:%.1f" % [my_uid, pos.x, pos.y, vel.x, vel.y])
@@ -1083,10 +1112,18 @@ func _sync_players_from_lobby() -> void:
 		if peer_id_str == "" or not peer_id_str.is_valid_int():
 			continue
 		var peer_id := int(peer_id_str)
+		var is_new_member := not _steam_id_to_peer_id.has(member_steam_id)
 		_steam_id_to_peer_id[member_steam_id] = peer_id
 		if peer_id > 0 and not has_node(str(peer_id)):
 			print("[_sync_players_from_lobby] spawning missing peer_id=", peer_id, " (steam_id=", member_steam_id, ")")
 			_rpc_spawn_player(peer_id)
+		if is_new_member and member_steam_id != Steam.getSteamID():
+			print("[SteamManager] emitting lobby_member_joined for steam_id=", member_steam_id)
+			lobby_member_joined.emit(member_steam_id)
+			var member_count := Steam.getNumLobbyMembers(lobby_id)
+			var max_members := Steam.getLobbyMemberLimit(lobby_id)
+			if max_members > 0 and member_count >= max_members:
+				lobby_full.emit()
 
 func _add_player(id : int = 1) -> void:
 	print("[_add_player] called — id=", id, " | my_uid=", multiplayer.get_unique_id(), " | is_server=", multiplayer.is_server())
@@ -1195,6 +1232,8 @@ func _leave_lobby() -> void:
 		print("Left lobby: ", lobby_id)
 		lobby_id = 0
 		is_host = false
+		lobby_max_players = 0
+		_lobby_full_fired = false
 
 		if is_inside_tree() and multiplayer.multiplayer_peer:
 			multiplayer.multiplayer_peer.close()
